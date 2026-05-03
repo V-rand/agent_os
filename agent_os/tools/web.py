@@ -23,9 +23,9 @@ def web_read(*, context: ToolContext, url: str, mode: str = "distilled") -> Tool
     text = _html_to_text(raw)
     if mode == "raw":
         result = ToolResult.ok(text)
-        result.summary = _distill_text(text)
+        result.summary = _distill_text(context, text, source=f"URL: {url}")
     elif mode == "distilled":
-        distilled = _distill_text(text)
+        distilled = _distill_text(context, text, source=f"URL: {url}")
         result = ToolResult.ok(distilled)
         result.summary = distilled
         result.artifacts = [{"type": "raw_web_content", "url": url, "bytes": len(raw.encode("utf-8"))}]
@@ -62,9 +62,10 @@ def web_search(*, context: ToolContext, query: str, limit: int = 5, mode: str = 
             "content": item.get("content"),
             "score": item.get("score"),
         })
-    content = json.dumps({"answer": data.get("answer"), "results": results}, ensure_ascii=False, sort_keys=True)
+    distilled = _distill_search_results(context, query, data.get("answer"), results)
+    content = json.dumps({"answer": data.get("answer"), "results": results, "distilled": distilled}, ensure_ascii=False, sort_keys=True)
     result = ToolResult.ok(content, data={"answer": data.get("answer"), "results": results})
-    result.summary = data.get("answer") or f"{len(results)} search results for {query!r}"
+    result.summary = distilled
     result.metadata = {"query": query, "mode": mode, "provider": "tavily", "truncated": False}
     return result
 
@@ -94,10 +95,59 @@ def _html_to_text(raw: str) -> str:
     return text.strip()
 
 
-def _distill_text(text: str) -> str:
+def _distill_text(context: ToolContext, text: str, *, source: str) -> str:
+    if context.model_client is not None and len(text) > 1200:
+        try:
+            response = context.model_client.complete(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a web content distillation subagent. Extract only facts useful to the caller. "
+                            "Do not answer unrelated questions. Preserve source attribution, dates, names, numbers, and uncertainty. "
+                            "Return concise markdown with sections: Key Facts, Caveats, Source."
+                        ),
+                    },
+                    {"role": "user", "content": f"{source}\n\nRaw extracted text:\n{text}"},
+                ],
+                tools=[],
+            )
+            distilled = (response.content or "").strip()
+            if distilled:
+                return distilled
+        except Exception:
+            pass
     sentences = re.split(r"(?<=[。.!?])\s+", text)
     selected = [item.strip() for item in sentences if item.strip()][:12]
     return "\n".join(f"- {item}" for item in selected) if selected else text[:2000]
+
+
+def _distill_search_results(context: ToolContext, query: str, answer: Any, results: list[dict[str, Any]]) -> str:
+    payload = json.dumps({"query": query, "answer": answer, "results": results}, ensure_ascii=False, sort_keys=True)
+    if context.model_client is not None and len(payload) > 1200:
+        try:
+            response = context.model_client.complete(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a search-result distillation subagent. Summarize search results for an agent. "
+                            "Preserve URLs, distinguish snippets from verified facts, and highlight which result to read next."
+                        ),
+                    },
+                    {"role": "user", "content": payload},
+                ],
+                tools=[],
+            )
+            distilled = (response.content or "").strip()
+            if distilled:
+                return distilled
+        except Exception:
+            pass
+    if answer:
+        return str(answer)
+    lines = [f"{idx}. {item.get('title') or '(untitled)'} - {item.get('url')}" for idx, item in enumerate(results, start=1)]
+    return "\n".join(lines) if lines else f"No search results for {query!r}."
 
 
 registry.register(

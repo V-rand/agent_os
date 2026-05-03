@@ -21,6 +21,7 @@ from agent_os.tools.delegate import delegate_task
 from agent_os.tools.artifacts import artifact_upsert, material_register
 from agent_os.tools.memory import memory_tool
 from agent_os.tools.todo import stage_update, todo_update
+from agent_os.tools.web import web_read
 from agent_os.types import ModelResponse, ToolResult, Usage
 
 
@@ -570,6 +571,38 @@ def test_web_tools_are_hidden_until_enabled(tmp_path: Path, monkeypatch) -> None
 
     AgentRuntime(config, model_client=client).run("search")
 
+    assert client.requests[0]["tools"] == []
+
+
+def test_web_read_distilled_uses_model_client_without_truncating_raw(monkeypatch, tmp_path: Path) -> None:
+    class Response:
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return ("<html><body>" + ("Important web fact. " * 200) + "</body></html>").encode("utf-8")
+
+    monkeypatch.setenv("AGENT_OS_ENABLE_WEB_TOOLS", "1")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    config = make_config(tmp_path)
+    config.web_tools_enabled = True
+    store = SQLiteStore(config.db_path)
+    session_id = store.create_session(title="web", workspace_root=str(tmp_path))
+    client = FakeClient([ModelResponse(content="## Key Facts\n- Distilled by subagent")])
+    context = ToolContext(config=config, store=store, memory=MemoryStore(config.memory_dir), skills=SkillManager(config.skills_dir), session_id=session_id, run_id="run", model_client=client)
+
+    distilled = web_read(context=context, url="https://example.test", mode="distilled")
+    raw = web_read(context=context, url="https://example.test", mode="raw")
+
+    assert "Distilled by subagent" in distilled.content
+    assert distilled.metadata["truncated"] is False
+    assert "Important web fact" in raw.content
+    assert raw.metadata["truncated"] is False
     assert client.requests[0]["tools"] == []
 
 
