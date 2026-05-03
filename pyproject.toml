@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-os"
+version = "0.1.0"
+description = "A business-agnostic Agent OS runtime with tools, skills, memory, sessions, and observability."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+agent-os = "agent_os.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_os", "agent_os.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

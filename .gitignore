@@ -1,0 +1,9 @@
+.env
+.codex
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.agent_os/
+*.egg-info/
+uv.lock
