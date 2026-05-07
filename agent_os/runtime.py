@@ -142,19 +142,27 @@ class AgentRuntime:
                     return
 
                 tool_messages = self._execute_tool_calls(sid, run_id, response.tool_calls)
-                for tool_msg in tool_messages:
+                for tool_item in tool_messages:
+                    tool_event_payload = tool_item["event_payload"]
+                    tool_msg = tool_item["message"]
                     messages.append(tool_msg)
                     tool_message_id = self.store.add_message(
                         sid,
                         "tool",
                         tool_msg["content"],
                         tool_call_id=tool_msg["tool_call_id"],
-                        metadata={"name": tool_msg.get("name")},
+                        metadata={"name": tool_msg.get("name"), **tool_event_payload},
                     )
                     live_tool = dict(tool_msg)
                     live_tool["id"] = tool_message_id
                     live_messages.append(live_tool)
-                    yield from self._emit(sid, run_id, "tool.completed", f"Tool {tool_msg.get('name')} completed", tool_msg)
+                    yield from self._emit(
+                        sid,
+                        run_id,
+                        "tool.completed",
+                        f"Tool {tool_msg.get('name')} completed",
+                        {**tool_msg, **tool_event_payload},
+                    )
 
             message_text = f"Max iterations exceeded: {self.config.max_iterations}"
             yield from self._emit(sid, run_id, "run.failed", message_text, {"iterations": iteration})
@@ -267,10 +275,17 @@ class AgentRuntime:
             latency_seconds=result.latency_seconds,
         )
         return {
-            "role": "tool",
-            "tool_call_id": call_id,
-            "name": name,
-            "content": model_tool_result_content(name, result),
+            "message": {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": model_tool_result_content(name, result),
+            },
+            "event_payload": {
+                "success": result.success,
+                "error": result.error,
+                "latency_seconds": result.latency_seconds,
+            },
         }
 
     def _emit(self, session_id: str, run_id: str, event_type: str, message: str,

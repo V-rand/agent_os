@@ -13,7 +13,7 @@ V1 includes:
 - Pluggable context compression with todo preservation
 - SQLite sessions, messages, tool calls, run events, summaries, todos, and child session links
 - JSONL observability logs with basic secret redaction
-- Minimal CLI entry point
+- CLI plus terminal chat adapter over the shared runtime event stream
 
 ## Quick Start
 
@@ -25,7 +25,10 @@ export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export AGENT_OS_MODEL=qwen-plus
 agent-os "hello"
+agent-os chat
 ```
+
+`agent-os chat` is the interactive terminal entry point. It shows concise runtime status for each turn, including estimated context tokens, context budget ratio, model latency, provider cache usage when reported, and tool execution time. In-chat commands include `/session`, `/history [n]`, `/tools`, `/events on|off`, and `/exit`.
 
 Inspection commands do not require a model API key:
 

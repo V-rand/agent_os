@@ -5,6 +5,7 @@ import json
 import sys
 
 from .config import AgentOSConfig
+from .interfaces.terminal import run_terminal_chat
 from .runtime import AgentRuntime
 from .storage import SQLiteStore
 from .tools.registry import discover_builtin_tools, registry
@@ -20,6 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--session-id", help="Existing session id to resume.")
     run_parser.add_argument("--json", action="store_true", help="Print final result as JSON.")
     run_parser.add_argument("--events", action="store_true", help="Print runtime events.")
+
+    chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat (REPL).")
+    chat_parser.add_argument("--session-id", help="Existing session id to resume.")
+    chat_parser.add_argument("--events", action="store_true", help="Print runtime events.")
+    chat_parser.add_argument("--json", action="store_true", help="Print each turn as JSON.")
 
     sessions_parser = subparsers.add_parser("sessions", help="List recent sessions.")
     sessions_parser.add_argument("--limit", type=int, default=50)
@@ -50,13 +56,15 @@ def build_legacy_run_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "sessions", "show", "events", "tools"}
+    commands = {"run", "chat", "sessions", "show", "events", "tools"}
     if not any(arg in commands for arg in raw_args):
         args = build_legacy_run_parser().parse_args(raw_args)
         return _run_message(args)
     args = build_parser().parse_args(raw_args)
     if args.command in {None, "run"}:
         return _run_message(args)
+    if args.command == "chat":
+        return _chat_loop(args)
     config = AgentOSConfig.load(args.config)
     store = SQLiteStore(config.db_path)
     if args.command == "sessions":
@@ -107,6 +115,15 @@ def _run_message(args: argparse.Namespace) -> int:
     else:
         print(final_payload.get("content", ""))
     return 0
+
+
+def _chat_loop(args: argparse.Namespace) -> int:
+    return run_terminal_chat(
+        config_path=args.config,
+        session_id=args.session_id,
+        raw_events=args.events,
+        json_output=args.json,
+    )
 
 
 def _print_json_or_text(value, as_json: bool, renderer) -> int:

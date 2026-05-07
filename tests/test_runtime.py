@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
+import builtins
 
 from agent_os.cli import main as cli_main
 from agent_os.cache_stability import model_tool_result_content, tool_schema_fingerprint
@@ -293,6 +294,70 @@ def test_cli_inspection_commands_output_json(tmp_path: Path, capsys) -> None:
     assert events[-1]["type"] == "run.completed"
 
 
+def test_cli_chat_repl_reuses_session_and_supports_session_command(tmp_path: Path, capsys, monkeypatch) -> None:
+    config_path = tmp_path / "agent_os.json"
+    config_path.write_text(json.dumps({"state_dir": str(tmp_path / ".agent_os"), "workspace_root": str(tmp_path)}), encoding="utf-8")
+
+    inputs = iter(["hello", "/session", "/history 4", "second turn", "/exit"])
+    monkeypatch.setattr(builtins, "input", lambda _: next(inputs))
+    from agent_os.interfaces import terminal as terminal_module
+
+    class StubRuntime:
+        def __init__(self, config):
+            self.store = SQLiteStore(config.db_path)
+            self.workspace_root = config.workspace_root
+
+        def stream(self, message: str, session_id: str | None = None):
+            sid = self.store.ensure_session(session_id, title=message[:80] or "New session", workspace_root=str(self.workspace_root))
+            run_id = "run-stub"
+            self.store.add_message(sid, "user", message)
+            yield SimpleNamespace(
+                type="context.compiled",
+                message="Context compiled",
+                session_id=sid,
+                run_id=run_id,
+                payload={"estimated_tokens": 42, "context_budget_ratio": 0.01, "tools": ["file_read"], "compressed": False},
+            )
+            yield SimpleNamespace(
+                type="model.responded",
+                message="Model response",
+                session_id=sid,
+                run_id=run_id,
+                payload={
+                    "latency_seconds": 0.25,
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cached_prompt_tokens": 5},
+                    "cache_hit_rate": 0.5,
+                    "cache_hit_rate_known": True,
+                    "tool_call_count": 0,
+                },
+            )
+            payload = {
+                "content": f"echo:{message}",
+                "messages": [{"role": "assistant", "content": f"echo:{message}"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "iterations": 1,
+            }
+            self.store.add_message(sid, "assistant", f"echo:{message}")
+            yield SimpleNamespace(type="run.completed", message="Run completed", session_id=sid, run_id=run_id, payload=payload)
+
+    monkeypatch.setattr(terminal_module, "AgentRuntime", StubRuntime)
+
+    assert cli_main(["--config", str(config_path), "chat"]) == 0
+    output = capsys.readouterr().out
+    assert "Agent OS terminal chat" in output
+    assert "context> 42 tokens" in output
+    assert "model> 0.25s tokens=10/2/12 cache=5 (50.0%)" in output
+    assert "user> hello" in output
+    assert "assistant> echo:hello" in output
+
+    store = SQLiteStore(tmp_path / ".agent_os" / "state.db")
+    sessions = store.list_sessions(limit=10)
+    assert len(sessions) == 1
+    messages = store.list_messages(sessions[0]["id"])
+    user_messages = [m for m in messages if m["role"] == "user"]
+    assert len(user_messages) == 2
+
+
 def test_runtime_records_model_client_error(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     runtime = AgentRuntime(config, model_client=FailingClient(ModelClientError("timeout", "request timed out")))
@@ -398,11 +463,15 @@ def test_runtime_tool_message_excludes_dynamic_latency_and_preserves_full_result
         ModelResponse(content="done"),
     ])
 
-    AgentRuntime(config, model_client=client).run("read")
+    events = list(AgentRuntime(config, model_client=client).stream("read"))
     tool_message = client.requests[1]["messages"][-1]
+    tool_event = next(event for event in events if event.type == "tool.completed")
 
     assert tool_message["role"] == "tool"
     assert "latency" not in tool_message["content"]
+    assert "latency_seconds" not in tool_message
+    assert tool_event.payload["latency_seconds"] >= 0
+    assert tool_event.payload["success"] is True
     payload = json.loads(tool_message["content"])
     assert payload["status"] == "ok"
     assert payload["content"] == full_content
