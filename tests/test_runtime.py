@@ -15,6 +15,7 @@ from agent_os.compression import SUMMARY_PREFIX
 from agent_os.memory import MemoryStore
 from agent_os.model_client import ModelClientError, OpenAIChatClient
 from agent_os.runtime import AgentRuntime
+from agent_os.session_manager import SessionManager
 from agent_os.skills import SkillManager
 from agent_os.storage import SQLiteStore
 from agent_os.tools.context import ToolContext
@@ -344,11 +345,11 @@ def test_cli_chat_repl_reuses_session_and_supports_session_command(tmp_path: Pat
 
     assert cli_main(["--config", str(config_path), "chat"]) == 0
     output = capsys.readouterr().out
-    assert "Agent OS terminal chat" in output
+    assert "Agent OS chat" in output
     assert "context> 42 tokens" in output
     assert "model> 0.25s tokens=10/2/12 cache=5 (50.0%)" in output
     assert "user> hello" in output
-    assert "assistant> echo:hello" in output
+    assert "echo:hello" in output
 
     store = SQLiteStore(tmp_path / ".agent_os" / "state.db")
     sessions = store.list_sessions(limit=10)
@@ -356,6 +357,54 @@ def test_cli_chat_repl_reuses_session_and_supports_session_command(tmp_path: Pat
     messages = store.list_messages(sessions[0]["id"])
     user_messages = [m for m in messages if m["role"] == "user"]
     assert len(user_messages) == 2
+    assert Path(sessions[0]["workspace_root"]).name == "workspace"
+
+
+def test_session_manager_creates_case_workspace_and_renames_session(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = SQLiteStore(config.db_path)
+    manager = SessionManager(config, store)
+
+    session = manager.create(title="Case A")
+    workspace = Path(session["workspace_root"])
+    renamed = manager.rename(session["id"], "Case A renamed")
+
+    assert workspace.exists()
+    assert workspace.name == "workspace"
+    assert workspace.parent.parent == config.state_dir / "sessions"
+    assert (workspace.parent / "logs").exists()
+    assert (workspace.parent / "exports").exists()
+    assert renamed["title"] == "Case A renamed"
+
+
+def test_runtime_resumed_session_uses_sqlite_workspace_root(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.enabled_toolsets = {"files"}
+    manager = SessionManager(config)
+    session_a = manager.create(title="Case A")
+    session_b = manager.create(title="Case B")
+    Path(session_a["workspace_root"], "note.txt").write_text("case A", encoding="utf-8")
+    Path(session_b["workspace_root"], "note.txt").write_text("case B", encoding="utf-8")
+    (tmp_path / "note.txt").write_text("project root", encoding="utf-8")
+    client = FakeClient([
+        ModelResponse(
+            content=None,
+            tool_calls=[{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": json.dumps({"path": "note.txt"})},
+            }],
+        ),
+        ModelResponse(content="done"),
+    ])
+
+    AgentRuntime(config, model_client=client).run("read", session_id=session_b["id"])
+    tool_message = client.requests[1]["messages"][-1]
+
+    assert "case B" in tool_message["content"]
+    assert "case A" not in tool_message["content"]
+    assert "project root" not in tool_message["content"]
+    assert Path(session_b["workspace_root"]).parent.joinpath("logs", "events.jsonl").exists()
 
 
 def test_runtime_records_model_client_error(tmp_path: Path) -> None:

@@ -7,13 +7,14 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any, Iterator
 
 from .config import AgentOSConfig
 from .compression import CompressionSubagentEngine
 from .context import ContextManager, PromptBuilder, estimate_messages_tokens
 from .cache_stability import model_tool_result_content, tool_schema_fingerprint
-from .logging_utils import JSONLLogger
+from .logging_utils import JSONLLogger, redact
 from .memory import MemoryStore
 from .model_client import ModelClient, ModelClientError, OpenAIChatClient
 from .skills import SkillManager
@@ -68,25 +69,28 @@ class AgentRuntime:
         )
 
     def stream(self, message: str, session_id: str | None = None) -> Iterator[RunEvent]:
+        existed = bool(session_id and self.store.get_session(session_id))
         sid = self.store.ensure_session(
             session_id,
             title=message[:80] or "New session",
             workspace_root=str(self.config.workspace_root),
             metadata={"model": self.config.model, "base_url": self.config.base_url},
         )
+        run_config = self._config_for_session(sid) if existed else self.config
+        context_manager = self._context_manager_for(run_config) if run_config.workspace_root != self.config.workspace_root else self.context_manager
         run_id = str(uuid.uuid4())
         yield from self._emit(sid, run_id, "run.started", "Run started", {"message": message})
-        live_messages = self.context_manager.load_history(sid)
+        live_messages = context_manager.load_history(sid)
         user_message_id = self.store.add_message(sid, "user", message)
         live_messages.append({"id": user_message_id, "role": "user", "content": message})
 
-        effective_toolsets = self.config.enabled_toolsets - self.config.disabled_toolsets
-        tools = registry.schemas(effective_toolsets, self.config.disabled_toolsets)
+        effective_toolsets = run_config.enabled_toolsets - run_config.disabled_toolsets
+        tools = registry.schemas(effective_toolsets, run_config.disabled_toolsets)
         tools_fingerprint = tool_schema_fingerprint(tools)
         usage_total = Usage()
 
         try:
-            compiled = self.context_manager.compile(sid, live_messages=live_messages, auto_compress=False)
+            compiled = context_manager.compile(sid, live_messages=live_messages, auto_compress=False)
             messages = _api_messages([{"role": "system", "content": compiled.system_prompt}, *compiled.messages])
             yield from self._emit(sid, run_id, "context.compiled", "Context compiled", {
                 "estimated_tokens": compiled.estimated_tokens,
@@ -94,16 +98,24 @@ class AgentRuntime:
                 "compressed": compiled.compressed,
                 "compression": compiled.compression_metadata,
                 "tools": [tool["function"]["name"] for tool in tools],
-                "tool_status": registry.status(effective_toolsets, self.config.disabled_toolsets),
-                "system_prompt_fingerprint": self.prompt_builder.fingerprint(),
+                "tool_status": registry.status(effective_toolsets, run_config.disabled_toolsets),
+                "system_prompt_fingerprint": context_manager.prompt_builder.fingerprint(),
                 "tool_schema_fingerprint": tools_fingerprint,
+                "workspace_root": str(run_config.workspace_root),
             })
 
             final_content = ""
             iteration = 0
-            while iteration < self.config.max_iterations:
+            while iteration < run_config.max_iterations:
                 iteration += 1
-                sid, messages, live_messages = self._compress_loop_context_if_needed(sid, run_id, messages, live_messages)
+                sid, messages, live_messages = self._compress_loop_context_if_needed(
+                    sid,
+                    run_id,
+                    messages,
+                    live_messages,
+                    config=run_config,
+                    context_manager=context_manager,
+                )
                 yield from self._emit(sid, run_id, "model.requested", f"Model request {iteration}", {})
                 start = time.perf_counter()
                 response = self.model_client.complete(messages=copy.deepcopy(messages), tools=copy.deepcopy(tools))
@@ -141,7 +153,7 @@ class AgentRuntime:
                     yield from self._emit(sid, run_id, "run.completed", "Run completed", payload)
                     return
 
-                tool_messages = self._execute_tool_calls(sid, run_id, response.tool_calls)
+                tool_messages = self._execute_tool_calls(sid, run_id, response.tool_calls, config=run_config)
                 for tool_item in tool_messages:
                     tool_event_payload = tool_item["event_payload"]
                     tool_msg = tool_item["message"]
@@ -164,7 +176,7 @@ class AgentRuntime:
                         {**tool_msg, **tool_event_payload},
                     )
 
-            message_text = f"Max iterations exceeded: {self.config.max_iterations}"
+            message_text = f"Max iterations exceeded: {run_config.max_iterations}"
             yield from self._emit(sid, run_id, "run.failed", message_text, {"iterations": iteration})
         except ModelClientError as exc:
             yield from self._emit(sid, run_id, "run.failed", exc.message, {"error": exc.to_payload()})
@@ -173,9 +185,17 @@ class AgentRuntime:
                 "error": {"category": "unknown", "message": f"{type(exc).__name__}: {exc}"}
             })
 
-    def _execute_tool_calls(self, session_id: str, run_id: str, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _execute_tool_calls(
+        self,
+        session_id: str,
+        run_id: str,
+        tool_calls: list[dict[str, Any]],
+        *,
+        config: AgentOSConfig | None = None,
+    ) -> list[dict[str, Any]]:
+        active_config = config or self.config
         context = ToolContext(
-            config=self.config,
+            config=active_config,
             store=self.store,
             memory=self.memory,
             skills=self.skills,
@@ -201,17 +221,22 @@ class AgentRuntime:
         run_id: str,
         messages: list[dict[str, Any]],
         live_messages: list[dict[str, Any]],
+        *,
+        config: AgentOSConfig | None = None,
+        context_manager: ContextManager | None = None,
     ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-        threshold = int(self.config.context_budget_tokens * self.config.compression_trigger_ratio)
-        if not self.config.compression_enabled or estimate_messages_tokens(messages) < threshold:
+        active_config = config or self.config
+        active_context_manager = context_manager or self.context_manager
+        threshold = int(active_config.context_budget_tokens * active_config.compression_trigger_ratio)
+        if not active_config.compression_enabled or estimate_messages_tokens(messages) < threshold:
             return session_id, messages, live_messages
-        compressed_live = self.context_manager.compress(session_id, live_messages)
+        compressed_live = active_context_manager.compress(session_id, live_messages)
         if compressed_live == live_messages:
             return session_id, messages, live_messages
         active_session_id = session_id
-        if self.config.compression_create_continuation_session:
-            active_session_id = self._create_continuation_session(session_id, run_id, compressed_live)
-        compiled = self.context_manager.compile(active_session_id, live_messages=compressed_live, auto_compress=False)
+        if active_config.compression_create_continuation_session:
+            active_session_id = self._create_continuation_session(session_id, run_id, compressed_live, config=active_config)
+        compiled = active_context_manager.compile(active_session_id, live_messages=compressed_live, auto_compress=False)
         api_messages = _api_messages([{"role": "system", "content": compiled.system_prompt}, *compiled.messages])
         return active_session_id, api_messages, compressed_live
 
@@ -220,11 +245,14 @@ class AgentRuntime:
         parent_session_id: str,
         run_id: str,
         compressed_live: list[dict[str, Any]],
+        *,
+        config: AgentOSConfig | None = None,
     ) -> str:
+        active_config = config or self.config
         parent = self.store.get_session(parent_session_id) or {}
         child_session_id = self.store.create_session(
             title=f"Continuation: {parent.get('title') or parent_session_id}",
-            workspace_root=str(self.config.workspace_root),
+            workspace_root=str(parent.get("workspace_root") or active_config.workspace_root),
             parent_session_id=parent_session_id,
             stage=str(parent.get("stage") or "continuation"),
             metadata={
@@ -256,6 +284,29 @@ class AgentRuntime:
             {"child_session_id": child_session_id},
         )
         return child_session_id
+
+    def _config_for_session(self, session_id: str) -> AgentOSConfig:
+        session = self.store.get_session(session_id) or {}
+        workspace = Path(str(session.get("workspace_root") or self.config.workspace_root)).expanduser()
+        if not workspace.is_absolute():
+            workspace = (self.config.workspace_root / workspace).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        return replace(self.config, workspace_root=workspace.resolve())
+
+    def _context_manager_for(self, config: AgentOSConfig) -> ContextManager:
+        prompt_builder = PromptBuilder(config, self.memory, self.skills)
+        compression_client = self.model_client
+        if self.config.compression_model:
+            compression_client = OpenAIChatClient(replace(config, model=self.config.compression_model))
+        return ContextManager(
+            config,
+            self.store,
+            prompt_builder,
+            compression_engine=CompressionSubagentEngine(
+                compression_client,
+                max_summary_tokens=config.compression_max_summary_tokens,
+            ),
+        )
 
     def _execute_one_tool(self, context: ToolContext, run_id: str, session_id: str, call: dict[str, Any]) -> dict[str, Any]:
         function = call.get("function") or {}
@@ -294,7 +345,38 @@ class AgentRuntime:
         event = RunEvent(type=event_type, message=message, session_id=session_id, run_id=run_id, payload=safe_payload)
         self.store.add_run_event(run_id, session_id, event_type, message, safe_payload)
         self.logger.write(session_id=session_id, run_id=run_id, event_type=event_type, message=message, payload=safe_payload)
+        self._write_session_local_log(session_id, run_id, event_type, message, safe_payload)
         yield event
+
+    def _write_session_local_log(
+        self,
+        session_id: str,
+        run_id: str,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any],
+    ) -> None:
+        session = self.store.get_session(session_id) or {}
+        workspace = Path(str(session.get("workspace_root") or "")).expanduser()
+        metadata = dict(session.get("metadata") or {})
+        if metadata.get("kind") != "case_session" and workspace.name != "workspace":
+            return
+        root = workspace.parent if workspace.name == "workspace" else workspace
+        log_dir = root / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "session_id": session_id,
+                "run_id": run_id,
+                "event_type": event_type,
+                "message": message,
+                "payload": redact(payload),
+            }
+            with (log_dir / "events.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            return
 
 
 def _assistant_message(response: ModelResponse) -> dict[str, Any]:

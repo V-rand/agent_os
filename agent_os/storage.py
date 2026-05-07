@@ -198,6 +198,31 @@ class SQLiteStore:
         with self._transaction():
             self._conn.execute("UPDATE sessions SET stage = ?, updated_at = ? WHERE id = ?", (stage, now, session_id))
 
+    def update_session_workspace(self, session_id: str, workspace_root: str) -> None:
+        now = utcnow_iso()
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE sessions SET workspace_root = ?, updated_at = ? WHERE id = ?",
+                (workspace_root, now, session_id),
+            )
+
+    def update_session_title(self, session_id: str, title: str) -> None:
+        now = utcnow_iso()
+        with self._transaction():
+            self._conn.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (title, now, session_id))
+
+    def end_session(self, session_id: str, *, reason: str = "") -> None:
+        now = utcnow_iso()
+        session = self.get_session(session_id)
+        metadata = dict(session.get("metadata") or {}) if session else {}
+        if reason:
+            metadata["end_reason"] = reason
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE sessions SET status = 'ended', ended_at = ?, updated_at = ?, metadata_json = ? WHERE id = ?",
+                (now, now, json.dumps(metadata, ensure_ascii=False), session_id),
+            )
+
     def list_child_sessions(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

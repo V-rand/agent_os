@@ -30,6 +30,8 @@ agent-os chat
 
 `agent-os chat` is the interactive terminal entry point. It shows concise runtime status for each turn, including estimated context tokens, context budget ratio, model latency, provider cache usage when reported, and tool execution time. In-chat commands include `/session`, `/history [n]`, `/tools`, `/events on|off`, and `/exit`.
 
+Chat sessions are case-scoped. Use `/new <title>` to create an isolated session workspace under `.agent_os/sessions/<session_id>-<title>/workspace`. File, artifact, material, and shell tools run inside that session workspace when the session is resumed from SQLite, so files from different cases do not collide. Per-session process logs are mirrored to `.agent_os/sessions/<session>/logs/events.jsonl`; the global audit copy remains in `.agent_os/logs/<session_id>.jsonl`.
+
 Inspection commands do not require a model API key:
 
 ```bash
